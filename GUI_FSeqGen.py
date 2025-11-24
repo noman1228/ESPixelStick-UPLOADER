@@ -11,10 +11,8 @@ from functools import partial
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import importlib
-import subprocess
 
-# -------------------- Optional GUI imports --------------------
+# ---------------- Tkinter / GUI imports ----------------
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
@@ -23,7 +21,7 @@ try:
 except Exception:
     TK_AVAILABLE = False
 
-# -------------------- Optional extra libs ---------------------
+# ---------------- Optional libs ----------------
 try:
     from tqdm import tqdm
 except ImportError:
@@ -34,50 +32,10 @@ try:
 except ImportError:
     requests = None
 
-# ======================================================================
-# Auto-install required Python packages (requests, tqdm) if missing
-# ======================================================================
 
-REQUIRED_PACKAGES = ["requests", "tqdm"]
-
-
-def ensure_requirements():
-    missing = []
-
-    for pkg in REQUIRED_PACKAGES:
-        try:
-            importlib.import_module(pkg)
-        except ImportError:
-            missing.append(pkg)
-
-    if not missing:
-        return  # All good
-
-    print("\n=== Installing missing dependencies ===")
-    print("Missing:", ", ".join(missing))
-
-    for pkg in missing:
-        print(f"Installing {pkg}...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-        except Exception as e:
-            print(f"FAILED to install {pkg}: {e}")
-            print("Please install manually: pip install " + pkg)
-            sys.exit(1)
-
-    print("\nAll missing packages installed successfully.")
-    print("Restarting script...\n")
-
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-# Only run installer in real Python, not in frozen EXE builds
-if not getattr(sys, "frozen", False):
-    ensure_requirements()
-
-# ======================================================================
+# ---------------------------------------------------------------------------
 # Data classes
-# ======================================================================
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Controller:
@@ -88,25 +46,24 @@ class Controller:
     end_channel: int    # 1-based global end channel
 
 
-# ======================================================================
-# Utility: prompt with default
-# ======================================================================
+# ---------------------------------------------------------------------------
+# Utility: prompt with default (CLI)
+# ---------------------------------------------------------------------------
 
 def prompt_with_default(prompt: str, default: str) -> str:
     text = input(f"{prompt} (default={default}): ").strip()
     return text if text else default
 
 
-# ======================================================================
-# Parse xLights networks XML  (original behavior)
-# ======================================================================
+# ---------------------------------------------------------------------------
+# Parse xLights networks XML
+# ---------------------------------------------------------------------------
 
 def parse_networks_xml(xml_path: Path) -> list[Controller]:
     if not xml_path.is_file():
         print(f"[ERROR] Networks XML not found: {xml_path}")
         sys.exit(1)
 
-    print(f"Parsing networks XML: {xml_path}")
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
@@ -130,10 +87,6 @@ def parse_networks_xml(xml_path: Path) -> list[Controller]:
             max_channels = int(max_ch_str)
         except ValueError:
             print(f"[WARN] Controller '{name}' has invalid MaxChannels '{max_ch_str}', skipping.")
-            continue
-
-        if max_channels <= 0:
-            print(f"[WARN] Controller '{name}' has MaxChannels <= 0 ({max_channels}), skipping.")
             continue
 
         start_chan = next_start_channel
@@ -164,22 +117,32 @@ def parse_networks_xml(xml_path: Path) -> list[Controller]:
     return controllers
 
 
-# ======================================================================
-# FSEQ parsing helpers (original logic)
-# ======================================================================
+# ---------------------------------------------------------------------------
+# FSEQ parsing helpers (v2, uncompressed)
+# ---------------------------------------------------------------------------
 
 class FseqFormatError(Exception):
     pass
 
 
-def read_fseq_header(f):
+def read_fseq_header(f) -> tuple[bytes, bytes, int, int, int, int, int]:
     """
-    Original permissive FSEQ v2-style header reader you were using.
+    Read the base 32-byte header and any extra header bytes up to ChannelDataOffset.
+
+    Returns:
+        base_header (32 bytes),
+        extra_header (variable, may be empty),
+        channel_data_offset,
+        channel_count_per_frame,
+        frame_count,
+        step_time_ms,
+        compression_type
     """
     base_header = f.read(32)
     if len(base_header) != 32:
         raise FseqFormatError("File too small for FSEQ v2 header (32 bytes).")
 
+    # "FSEQ" / "PSEQ" magic
     magic = base_header[0:4]
     if magic not in (b"FSEQ", b"PSEQ"):
         raise FseqFormatError(f"Unknown FSEQ magic {magic!r}.")
@@ -199,11 +162,13 @@ def read_fseq_header(f):
     compression_type = comp_byte & 0x0F
     sparse_range_count = base_header[22]
 
+    # For our purposes we only support uncompressed v2 files as input
     if compression_type != 0:
         raise FseqFormatError(
             f"Compression type {compression_type} not supported (only uncompressed)."
         )
 
+    # There may be variable headers etc. between 32 and channel_data_offset
     extra_len = channel_data_offset - 32
     if extra_len < 0:
         extra_len = 0
@@ -213,6 +178,7 @@ def read_fseq_header(f):
             f"Truncated header: expected {extra_len} extra bytes, got {len(extra_header)}."
         )
 
+    # header_size should generally match channel_data_offset, but we don't rely on it.
     return (
         base_header,
         extra_header,
@@ -230,24 +196,47 @@ def build_sparse_header_for_controller(
     controller: Controller,
 ) -> bytes:
     """
-    Build a per-controller v2 header with no sparse table (your original).
+    Build a new FSEQ v2 header for a single controller, **without** sparse ranges.
+
+    We keep the file as:
+      - v2 uncompressed
+      - per-controller channel count
+      - no sparse table (sparse_range_count = 0)
+
+    Since the per-controller file already contains only that controller's
+    channels in a dense block, sparse ranges are unnecessary and cause
+    ESPS to complain.
     """
     header = bytearray(base_header)
 
+    # No sparse ranges
     sparse_count = 0
     sparse_table_len = 0
 
+    # New header size = base 32 + existing extra_header, no sparse table
     header_size = 32 + len(extra_header) + sparse_table_len
 
+    # Channel Data Offset (bytes 4-5) and Header Size (bytes 8-9)
     header[4:6] = header_size.to_bytes(2, "little")
     header[8:10] = header_size.to_bytes(2, "little")
 
+    # Channel count per frame: this controller only
     header[10:14] = controller.max_channels.to_bytes(4, "little")
 
+    # CompressionType/ExtBlockCount at byte 20:
+    # keep upper 4 bits (extended compression block count), force compression type to 0
     header[20] = (header[20] & 0xF0) | 0x00
+
+    # Compression Block Count at byte 21 (lower 8 bits) = 0 (uncompressed)
     header[21] = 0
+
+    # Sparse Range Count at byte 22 = 0 (no sparse data present)
     header[22] = sparse_count
 
+    # Reserved / flags at byte 23: leave as-is or zero if you want
+    # header[23] = 0
+
+    # No sparse table appended
     header_bytes = bytes(header) + extra_header
     if len(header_bytes) != header_size:
         raise RuntimeError(
@@ -257,9 +246,9 @@ def build_sparse_header_for_controller(
     return header_bytes
 
 
-# ======================================================================
-# Worker: process a single input .fseq into per-controller files
-# ======================================================================
+# ---------------------------------------------------------------------------
+# Worker: process a single input .fseq into per-controller sparse .fseq files
+# ---------------------------------------------------------------------------
 
 def worker_generate_for_file(
     input_path_str: str,
@@ -267,7 +256,7 @@ def worker_generate_for_file(
     output_root: str,
 ) -> list[tuple[str, str, str]]:
     """
-    Process one global .fseq file and create per-controller files.
+    Process one global .fseq file and create per-controller sparse files.
 
     Returns list of (controller_name, controller_ip, local_output_path)
     for later FTP upload.
@@ -280,7 +269,7 @@ def worker_generate_for_file(
             (
                 base_header,
                 extra_header,
-                channel_data_offset,
+                _channel_data_offset,
                 channel_count_per_frame,
                 frame_count,
                 _step_time_ms,
@@ -306,9 +295,10 @@ def worker_generate_for_file(
         controller_files.append((ctl, dst))
         jobs.append((ctl.name, ctl.ip, str(out_path)))
 
+    # Stream frames
     frame_size = channel_count_per_frame
-
     with input_path.open("rb") as src:
+        _, _, channel_data_offset, _, _, _, _ = read_fseq_header(src)
         src.seek(channel_data_offset, os.SEEK_SET)
 
         for _ in range(frame_count):
@@ -325,15 +315,16 @@ def worker_generate_for_file(
                 end = start + ctl.max_channels
                 dst.write(frame[start:end])
 
-    for _, dst in controller_files:
+    # Close outputs
+    for ctl, dst in controller_files:
         dst.close()
 
     return jobs
 
 
-# ======================================================================
-# FTP upload helpers – ACTIVE mode + manual USER/PASS (original)
-# ======================================================================
+# ---------------------------------------------------------------------------
+# FTP upload helpers – ACTIVE mode + manual USER/PASS (working version)
+# ---------------------------------------------------------------------------
 
 def ftp_upload_file(
     ip: str,
@@ -344,13 +335,11 @@ def ftp_upload_file(
     debug: bool = False,
 ) -> tuple[bool, str | None]:
     """
-    Upload a file via FTP in ACTIVE (PORT) mode, with manual USER/PASS.
-    Explicitly deletes any existing remote file of the same name first,
-    so uploads always overwrite.
+    Upload a file via FTP in ACTIVE (PORT) mode, with manual USER/PASS
+    to work around SimpleFTPServer's broken reply.
     """
     try:
-        filename = os.path.basename(local_path)
-        print(f"[FTP] Connecting to {ip}:21 for {filename}")
+        print(f"[FTP] Connecting to {ip}:21 for {os.path.basename(local_path)}")
         with FTP() as ftp:
             if debug:
                 ftp.set_debuglevel(2)
@@ -358,7 +347,7 @@ def ftp_upload_file(
             ftp.connect(ip, 21, timeout=60)
             print(f"[FTP] Connected to {ip}, forcing manual USER/PASS login as {username!r}")
 
-            # Manual USER/PASS
+            # Manual USER/PASS dance, ignoring the bogus 220 after USER
             resp_user = ftp.sendcmd(f"USER {username}")
             if debug:
                 print(f"[FTP DEBUG] USER resp: {resp_user!r}")
@@ -370,15 +359,16 @@ def ftp_upload_file(
             except error_perm as e:
                 return False, f"Login failed on {ip}: {e}"
 
-            # ACTIVE mode
+            # ACTIVE mode (SimpleFTPServer expects single connection + PORT)
             ftp.set_pasv(False)
             print(f"[FTP] Using ACTIVE mode (PORT) for {ip}")
 
-            # Change / create remote directory
+            # Handle remote directory (optional)
             if remote_dir and remote_dir not in ("/", ".", ""):
                 try:
                     ftp.cwd(remote_dir)
                 except error_perm:
+                    # Try to create path recursively
                     parts = [p for p in remote_dir.split("/") if p]
                     for p in parts:
                         try:
@@ -387,18 +377,7 @@ def ftp_upload_file(
                             pass
                         ftp.cwd(p)
 
-            # Try to delete any existing remote file first
-            try:
-                print(f"[FTP] DELE {filename} on {ip} (if it exists)")
-                ftp.delete(filename)
-            except error_perm:
-                # File probably didn't exist; ignore
-                pass
-            except Exception as e:
-                # Non-fatal; log and continue
-                print(f"[FTP WARN] Could not delete {filename} on {ip}: {e}")
-
-            # Now upload fresh
+            filename = os.path.basename(local_path)
             print(f"[FTP] STOR {filename} -> {ip}")
             with open(local_path, "rb") as f:
                 ftp.storbinary(f"STOR {filename}", f, blocksize=16 * 1024)
@@ -416,7 +395,6 @@ def ftp_upload_file(
         return False, str(e)
 
 
-
 def _upload_job_list_for_controller(
     controller_key: tuple[str, str],
     controller_jobs: list[tuple[str, str, str]],
@@ -427,6 +405,10 @@ def _upload_job_list_for_controller(
     progress=None,
     lock=None,
 ):
+    """
+    Runs in a single thread per controller:
+    uploads that controller's files sequentially, updating a shared progress bar.
+    """
     ctrl_name, ip = controller_key
     results = []
     for _, _, local_path in controller_jobs:
@@ -471,6 +453,21 @@ def ftp_upload_all(
     remote_dir: str,
     debug: bool = False,
 ):
+    """
+    Upload all files:
+      - One thread per controller (parallel across controllers)
+      - Within each controller, files are uploaded sequentially
+
+    Returns:
+        dict[(controller_name, ip)] -> {
+            "controller_name": ...,
+            "ip": ...,
+            "results": [
+                {"filename": ..., "local_path": ..., "ok": bool, "error": str|None},
+                ...
+            ]
+        }
+    """
     if not jobs:
         print("No files to upload.")
         return {}
@@ -530,11 +527,14 @@ def ftp_upload_all(
     return controller_reports
 
 
-# ======================================================================
-# HTTP verification & reboot helpers (original)
-# ======================================================================
+# ---------------------------------------------------------------------------
+# HTTP verification & reboot helpers
+# ---------------------------------------------------------------------------
 
 def _extract_remote_names_from_json(obj):
+    """
+    Try to pull a set of filenames out of whatever JSON structure the controller returns.
+    """
     names = set()
 
     if isinstance(obj, list):
@@ -557,6 +557,13 @@ def _extract_remote_names_from_json(obj):
 
 
 def verify_controller_files(ip: str, filenames: list[str], timeout: float = 5.0):
+    """
+    Hit http://<ip>/fseqfilelist and verify that the given filenames appear
+    (by name) on the controller.
+
+    Returns:
+        (verified_count, total_count, [error_strings])
+    """
     if requests is None:
         return 0, len(filenames), ["requests module not available; HTTP verify skipped"]
 
@@ -578,11 +585,13 @@ def verify_controller_files(ip: str, filenames: list[str], timeout: float = 5.0)
         data = resp.json()
         remote_names = _extract_remote_names_from_json(data)
     except ValueError:
+        # Not JSON? Fallback to dumb substring match on text.
         text = resp.text
         for fn in filenames:
             if fn in text:
                 remote_names.add(fn)
 
+    # If we didn't get anything useful, try a second time with raw text
     if not remote_names:
         text = resp.text
         for fn in filenames:
@@ -603,6 +612,9 @@ def verify_controller_files(ip: str, filenames: list[str], timeout: float = 5.0)
 
 
 def reboot_controller(ip: str, timeout: float = 5.0):
+    """
+    POST http://<ip>/X6 to ask the controller to reboot.
+    """
     if requests is None:
         return False, "requests module not available; reboot skipped"
 
@@ -617,6 +629,9 @@ def reboot_controller(ip: str, timeout: float = 5.0):
 
 
 def print_sync_report(controller_reports, verification_results, reboot_results):
+    """
+    Print a consolidated sync report for all controllers.
+    """
     print("\n=== Sync Report ===")
     print(
         f"{'Controller':15s} {'IP':15s} "
@@ -655,13 +670,139 @@ def print_sync_report(controller_reports, verification_results, reboot_results):
         )
 
 
-# ======================================================================
-# Tkinter GUI front-end (NEW)
-# ======================================================================
+# ---------------------------------------------------------------------------
+# CLI main (your working logic, preserved)
+# ---------------------------------------------------------------------------
+
+def cli_main() -> None:
+    print("=== FSEQ splitter (per controller, sparse v2, FTP upload) ===")
+
+    # Input directory with global .fseq exports
+    input_dir_str = prompt_with_default("Input path", ".")
+    input_dir = Path(input_dir_str).resolve()
+    if not input_dir.is_dir():
+        print(f"[ERROR] Input directory does not exist: {input_dir}")
+        sys.exit(1)
+
+    # xLights networks XML
+    default_xml = r"F:\Lights 2025\xlights_networks.xml"
+    xml_path_str = prompt_with_default("Networks XML path", default_xml)
+    xml_path = Path(xml_path_str).resolve()
+
+    controllers = parse_networks_xml(xml_path)
+
+    # Output root directory (controller subdirs will be created inside)
+    output_root = prompt_with_default("Output directory", "fseq_by_controller")
+    output_root_path = Path(output_root).resolve()
+    output_root_path.mkdir(parents=True, exist_ok=True)
+
+    # Find .fseq files (non-recursive)
+    input_files = sorted(
+        p for p in input_dir.iterdir()
+        if p.is_file() and p.suffix.lower() == ".fseq"
+    )
+
+    if not input_files:
+        print(f"[ERROR] No .fseq files found in {input_dir}")
+        sys.exit(1)
+
+    print(f"Found {len(input_files)} .fseq file(s) in {input_dir}")
+
+    # Multiprocessing across input files (generation phase)
+    use_mp = (len(input_files) > 1) and (mp.cpu_count() > 1)
+
+    upload_jobs: list[tuple[str, str, str]] = []
+
+    if use_mp:
+        worker = partial(
+            worker_generate_for_file,
+            controllers=controllers,
+            output_root=str(output_root_path),
+        )
+        with mp.Pool() as pool:
+            it = pool.imap_unordered(worker, [str(p) for p in input_files])
+            if tqdm is not None:
+                it = tqdm(it, total=len(input_files), desc="Generating")
+            for jobs in it:
+                upload_jobs.extend(jobs)
+    else:
+        if tqdm is not None:
+            file_iter = tqdm(input_files, desc="Generating")
+        else:
+            file_iter = input_files
+
+        for p in file_iter:
+            jobs = worker_generate_for_file(
+                str(p),
+                controllers=controllers,
+                output_root=str(output_root_path),
+            )
+            upload_jobs.extend(jobs)
+
+    # FTP upload
+    enable_upload = prompt_with_default(
+        "Enable FTP upload at END? (y/n)", "y"
+    ).strip().lower().startswith("y")
+
+    controller_reports = {}
+    verification_results = {}
+    reboot_results = {}
+
+    if enable_upload:
+        ftp_user = prompt_with_default("FTP username", "esps")
+        ftp_pass = prompt_with_default("FTP password", "esps")
+        ftp_dir = prompt_with_default("FTP directory", "/")
+        debug_str = prompt_with_default("Enable FTP debug output? (y/n)", "n")
+        ftp_debug = debug_str.strip().lower().startswith("y")
+
+        controller_reports = ftp_upload_all(
+            jobs=upload_jobs,
+            username=ftp_user,
+            password=ftp_pass,
+            remote_dir=ftp_dir,
+            debug=ftp_debug,
+        )
+
+        if controller_reports:
+            # Verify and reboot are optional, layered on top
+            do_verify = prompt_with_default(
+                "Verify uploaded files via HTTP /fseqfilelist? (y/n)", "y"
+            ).strip().lower().startswith("y")
+
+            do_reboot = prompt_with_default(
+                "Reboot controllers after upload via /X6? (y/n)", "n"
+            ).strip().lower().startswith("y")
+
+            if do_verify:
+                for key, rep in controller_reports.items():
+                    ctrl_name, ip = key
+                    filenames = [r["filename"] for r in rep["results"] if r["ok"]]
+                    ver_ok, ver_total, ver_errors = verify_controller_files(ip, filenames)
+                    verification_results[key] = (ver_ok, ver_total, ver_errors)
+
+            if do_reboot:
+                for key, rep in controller_reports.items():
+                    ctrl_name, ip = key
+                    ok, err = reboot_controller(ip)
+                    reboot_results[key] = (ok, err)
+    else:
+        print("FTP upload skipped (per user request).")
+
+    # Final sync report
+    if controller_reports:
+        print_sync_report(controller_reports, verification_results, reboot_results)
+
+    print("Done.")
+
+
+# ---------------------------------------------------------------------------
+# GUI implementation (Windows-friendly)
+# ---------------------------------------------------------------------------
 
 if TK_AVAILABLE:
 
     class QueueWriter:
+        """Redirect stdout/stderr to a Tk text widget via a queue."""
         def __init__(self, q: "queue.Queue[str]"):
             self.q = q
 
@@ -675,7 +816,7 @@ if TK_AVAILABLE:
     class FSeqGUI:
         def __init__(self, root: "tk.Tk"):
             self.root = root
-            self.root.title("FSEQ Splitter / Uploader")
+            self.root.title("FSEQ Splitter / ESPixelStick Uploader")
             self.root.geometry("900x600")
 
             self.log_queue: "queue.Queue[str]" = queue.Queue()
@@ -690,11 +831,13 @@ if TK_AVAILABLE:
             self._build_ui()
             self._poll_log_queue()
 
-        # ----------------------------- UI ---------------------------------
+        # ------------------------- UI layout -------------------------
+
         def _build_ui(self):
             main = ttk.Frame(self.root, padding=10)
             main.pack(fill=tk.BOTH, expand=True)
 
+            # Paths frame
             paths_frame = ttk.LabelFrame(main, text="Paths", padding=10)
             paths_frame.pack(fill=tk.X, expand=False)
 
@@ -725,6 +868,7 @@ if TK_AVAILABLE:
                 browse_cmd=self._browse_output_dir,
             )
 
+            # FTP / verify / reboot frame
             ftp_frame = ttk.LabelFrame(main, text="FTP / Verification / Reboot", padding=10)
             ftp_frame.pack(fill=tk.X, expand=False, pady=(10, 5))
 
@@ -776,6 +920,7 @@ if TK_AVAILABLE:
             )
             self.reboot_cb.grid(row=3, column=2, columnspan=2, sticky="w")
 
+            # Buttons
             button_frame = ttk.Frame(main)
             button_frame.pack(fill=tk.X, expand=False, pady=(10, 5))
 
@@ -787,6 +932,7 @@ if TK_AVAILABLE:
             )
             self.close_button.pack(side=tk.LEFT, padx=(10, 0))
 
+            # Log frame
             log_frame = ttk.LabelFrame(main, text="Log", padding=5)
             log_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
@@ -951,10 +1097,16 @@ if TK_AVAILABLE:
                 messagebox.showerror("Output directory error", f"{output_dir}\n{e}")
                 return
 
-            controllers = parse_networks_xml(xml_path)
+            # parse networks XML (catch SystemExit from CLI-style function)
+            try:
+                controllers = parse_networks_xml(xml_path)
+            except SystemExit:
+                messagebox.showerror("Error", "No valid controllers found in XML.")
+                return
+
             selected_controllers = self._choose_controllers_dialog(controllers)
             if selected_controllers is None:
-                return
+                return  # cancelled
 
             self._clear_log()
             self._append_log("Starting FSEQ processing...\n")
@@ -992,7 +1144,7 @@ if TK_AVAILABLE:
                 self.root.after(0, _done)
 
         def _run_core(self, cfg: dict):
-            print("=== FSEQ splitter (per controller, FTP upload) ===")
+            print("=== FSEQ splitter (per controller, sparse v2, FTP upload) ===")
 
             input_dir = cfg["input_dir"]
             output_dir = cfg["output_dir"]
@@ -1008,6 +1160,7 @@ if TK_AVAILABLE:
                     f"Start={c.start_channel:7d} End={c.end_channel:7d}"
                 )
 
+            # Find .fseq files (non-recursive)
             input_files = sorted(
                 p for p in Path(input_dir).iterdir()
                 if p.is_file() and p.suffix.lower() == ".fseq"
@@ -1020,6 +1173,8 @@ if TK_AVAILABLE:
             print(f"Found {len(input_files)} .fseq file(s) in {input_dir}")
 
             upload_jobs: list[tuple[str, str, str]] = []
+
+            # For GUI, keep it simple: no multiprocessing, just loop
             file_iter = tqdm(input_files, desc="Generating") if tqdm is not None else input_files
             for p in file_iter:
                 print(f"[INFO] Processing {p.name}...")
@@ -1111,172 +1266,16 @@ if TK_AVAILABLE:
 else:
     def run_gui():
         print("Tkinter not available; falling back to CLI.")
-        main()
+        cli_main()
 
 
-# ======================================================================
-# CLI main() – original flow + optional controller selection
-# ======================================================================
-
-def main() -> None:
-    print("=== FSEQ splitter (per controller, FTP upload) ===")
-
-    input_dir_str = prompt_with_default("Input path", ".")
-    input_dir = Path(input_dir_str).resolve()
-    if not input_dir.is_dir():
-        print(f"[ERROR] Input directory does not exist: {input_dir}")
-        sys.exit(1)
-
-    default_xml = r"F:\Lights 2025\xlights_networks.xml"
-    xml_path_str = prompt_with_default("Networks XML path", default_xml)
-    xml_path = Path(xml_path_str).resolve()
-
-    controllers = parse_networks_xml(xml_path)
-
-    # NEW: optional controller subset selection
-    print("\nControllers discovered:")
-    for idx, c in enumerate(controllers, 1):
-        print(
-            f"  {idx:2d}. {c.name:15s} ({c.ip:15s}) "
-            f"Start={c.start_channel:7d} End={c.end_channel:7d}"
-        )
-
-    sel_str = prompt_with_default(
-        "Limit to specific controllers? "
-        "(comma-separated names or numbers, blank=all)",
-        "",
-    ).strip()
-
-    if sel_str:
-        selected: list[Controller] = []
-        tokens = [t.strip() for t in sel_str.split(",") if t.strip()]
-        for t in tokens:
-            matched = None
-            if t.isdigit():
-                idx = int(t)
-                if 1 <= idx <= len(controllers):
-                    matched = controllers[idx - 1]
-                else:
-                    print(f"[WARN] Controller index out of range: {t}")
-            if matched is None:
-                for c in controllers:
-                    if c.name.lower() == t.lower():
-                        matched = c
-                        break
-            if matched is None:
-                print(f"[WARN] No controller matching '{t}'")
-            elif matched not in selected:
-                selected.append(matched)
-
-        if not selected:
-            print("[ERROR] No valid controllers selected.")
-            sys.exit(1)
-
-        controllers = selected
-
-    print("\nUsing controllers:")
-    for c in controllers:
-        print(
-            f"  {c.name:15s} IP={c.ip:15s} "
-            f"Start={c.start_channel:7d} End={c.end_channel:7d}"
-        )
-
-    output_root = prompt_with_default("Output directory", "fseq_by_controller")
-    output_root_path = Path(output_root).resolve()
-    output_root_path.mkdir(parents=True, exist_ok=True)
-
-    input_files = sorted(
-        p for p in input_dir.iterdir()
-        if p.is_file() and p.suffix.lower() == ".fseq"
-    )
-
-    if not input_files:
-        print(f"[ERROR] No .fseq files found in {input_dir}")
-        sys.exit(1)
-
-    print(f"Found {len(input_files)} .fseq file(s) in {input_dir}")
-
-    use_mp = (len(input_files) > 1) and (mp.cpu_count() > 1)
-
-    upload_jobs: list[tuple[str, str, str]] = []
-
-    if use_mp:
-        worker = partial(
-            worker_generate_for_file,
-            controllers=controllers,
-            output_root=str(output_root_path),
-        )
-        with mp.Pool() as pool:
-            it = pool.imap_unordered(worker, [str(p) for p in input_files])
-            if tqdm is not None:
-                it = tqdm(it, total=len(input_files), desc="Generating")
-            for jobs in it:
-                upload_jobs.extend(jobs)
-    else:
-        file_iter = tqdm(input_files, desc="Generating") if tqdm is not None else input_files
-        for p in file_iter:
-            jobs = worker_generate_for_file(
-                str(p),
-                controllers=controllers,
-                output_root=str(output_root_path),
-            )
-            upload_jobs.extend(jobs)
-
-    enable_upload = prompt_with_default(
-        "Enable FTP upload at END? (y/n)", "y"
-    ).strip().lower().startswith("y")
-
-    controller_reports = {}
-    verification_results = {}
-    reboot_results = {}
-
-    if enable_upload:
-        ftp_user = prompt_with_default("FTP username", "esps")
-        ftp_pass = prompt_with_default("FTP password", "esps")
-        ftp_dir = prompt_with_default("FTP directory", "/")
-        debug_str = prompt_with_default("Enable FTP debug output? (y/n)", "n")
-        ftp_debug = debug_str.strip().lower().startswith("y")
-
-        controller_reports = ftp_upload_all(
-            jobs=upload_jobs,
-            username=ftp_user,
-            password=ftp_pass,
-            remote_dir=ftp_dir,
-            debug=ftp_debug,
-        )
-
-        if controller_reports:
-            do_verify = prompt_with_default(
-                "Verify uploaded files via HTTP /fseqfilelist? (y/n)", "y"
-            ).strip().lower().startswith("y")
-
-            do_reboot = prompt_with_default(
-                "Reboot controllers after upload via /X6? (y/n)", "n"
-            ).strip().lower().startswith("y")
-
-            if do_verify:
-                for key, rep in controller_reports.items():
-                    ctrl_name, ip = key
-                    filenames = [r["filename"] for r in rep["results"] if r["ok"]]
-                    ver_ok, ver_total, ver_errors = verify_controller_files(ip, filenames)
-                    verification_results[key] = (ver_ok, ver_total, ver_errors)
-
-            if do_reboot:
-                for key, rep in controller_reports.items():
-                    ctrl_name, ip = key
-                    ok, err = reboot_controller(ip)
-                    reboot_results[key] = (ok, err)
-    else:
-        print("FTP upload skipped (per user request).")
-
-    if controller_reports:
-        print_sync_report(controller_reports, verification_results, reboot_results)
-
-    print("Done.")
-
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Force CLI if requested, or if Tkinter unavailable
     if "--cli" in sys.argv or not TK_AVAILABLE:
-        main()
+        cli_main()
     else:
         run_gui()
