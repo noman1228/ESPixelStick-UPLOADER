@@ -1,4 +1,52 @@
 #!/usr/bin/env python
+# ---------------------------------------------------------------------------
+#                         ------  BOOTSTRAPPER   ------
+# Auto-install required Python packages (requests, tqdm) if missing
+# ---------------------------------------------------------------------------
+import sys
+import subprocess
+import importlib
+
+REQUIRED_PACKAGES = ["requests", "tqdm"]
+
+
+def ensure_requirements():
+    missing = []
+
+    for pkg in REQUIRED_PACKAGES:
+        try:
+            importlib.import_module(pkg)
+        except ImportError:
+            missing.append(pkg)
+
+    if not missing:
+        return  # All good
+
+    print("\n=== Installing missing dependencies ===")
+    print("Missing:", ", ".join(missing))
+
+    # Try pip install for each missing package
+    for pkg in missing:
+        print(f"Installing {pkg}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        except Exception as e:
+            print(f"FAILED to install {pkg}: {e}")
+            print("Please install manually: pip install " + pkg)
+            sys.exit(1)
+
+    print("\nAll missing packages installed successfully.")
+    print("Restarting script...\n")
+
+    # Relaunch script with same arguments
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# Only run installer in real Python, not in frozen EXE builds
+if not getattr(sys, "frozen", False):
+    ensure_requirements()
+
+
 import os
 import sys
 import struct
