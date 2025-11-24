@@ -1,74 +1,69 @@
-FSeq.py - README (Text Version)
----------------------------------
+# FSEQ Splitter & ESPixelStick Uploader  
+### Generate per-controller FSEQ files + optional FTP upload, verification, reboot
 
-Per-Controller FSEQ Splitter, Uploader, and Verifier
+This tool automatically:
 
-FSeq.py converts global xLights FSEQ v2 files into per-controller files using
-definitions from xlights_networks.xml. It can optionally upload, verify, and
-reboot controllers. This provides a fully synchronized set of ESP-based pixel
-controllers with minimum effort.
+- Reads your `xlights_networks.xml`
+- Lets you select which controllers to process
+- Splits global `.fseq` files into accurate per-controller slices
+- Uploads those files to ESPixelStick controllers (Active FTP)
+- Optionally verifies and reboots each controller
+- Runs in both a GUI and CLI mode
+- Auto-installs its required Python packages (`requests`, `tqdm`)
 
---------FEATURES--------
-  - Reads controllers, IPs, and MaxChannels from networks XML.
-  - Splits global FSEQ v2 (uncompressed only) into per-controller slices.
-  - Writes clean FSEQ v2 files without sparse tables.
-  - Organizes output by controller:
-      output/<ControllerName>/Show.fseq
-  - Optional FTP upload (active mode).
-  - Optional HTTP verification.
-  - Optional reboot via /X6 endpoint.
-  - Final sync summary report.
+It is built for large xLights installations where precise, controller-aligned distribution is required.
 
-REQUIREMENTS
-------------
-Python 3.x
+## ⚠ Required Before Use
 
-Optional:
+This tool **only works on**:
 
-    pip install tqdm requests
+### **Rendered xLights sequences saved as “V2 Uncompressed” FSEQ files**
 
+You must:
 
-INPUTS
-------
-  - Global .fseq files (v2, uncompressed)
-  - xlights_networks.xml with valid controllers
+1. Render your sequences in xLights  
+2. Save/export each as **Version 2 Uncompressed `.fseq`**  
+3. Place those files in your input directory
 
-USAGE
------
-Run:
+Without proper V2 uncompressed files, the splitter has nothing to process.
 
-    python FSeq.py
+## Quick Start — GUI
 
-Prompts:
-    1) Directory containing .fseq files
-    2) Path to xlights_networks.xml
-    3) Output directory
-    4) FTP upload? (y/n)
-    5) FTP username/password
-    6) FTP remote directory
-    7) Verify via HTTP? (y/n)
-    8) Reboot controllers? (y/n)
+1. Install Python 3.10+  
+2. Run:
+   ```
+   python FSeq.py
+   ```
+3. Choose:
+   - Input directory of **v2 uncompressed** `.fseq` files  
+   - Your `xlights_networks.xml`  
+   - Output directory  
+4. Select your controllers  
+5. Enable or disable Upload / Verify / Reboot  
+6. Click **Run**
 
-WORKFLOW
---------
-  1) Parse xlights_networks.xml
-  2) Determine channel ranges per controller
-  3) Read each global FSEQ
-  4) Slice each frame for each controller
-  5) Write per-controller FSEQ files
-  6) (Optional) Upload files via FTP
-  7) (Optional) Verify via HTTP
-  8) (Optional) Reboot controllers
-  9) Print final sync summary
+## Quick Start — CLI
 
-NOTES
------
-  - Only FSEQ v2 uncompressed is supported.
-  - FTP uses ACTIVE mode.
-  - HTTP endpoints required:
-      /fseqfilelist  for verification
-      /X6            for reboot
+```
+python FSeq.py --cli
+```
 
-LICENSE
--------
-  Free to use and modify.
+Prompts will guide you through controller selection and optional FTP/upload settings.
+
+## Features (Summary)
+
+- Controller auto-detection from networks XML  
+- Controller selection UI  
+- Accurate per-controller slicing based on global channel offsets  
+- FTP upload with delete-before-store overwrite handling  
+- Optional verification using `/fseqfilelist`  
+- Optional reboot via `/X6`  
+- Automatic dependency installation  
+- GUI by default; CLI available  
+
+## Project Layout
+
+```
+FSeq.py      # Single-file application
+README.md    # Documentation
+```
