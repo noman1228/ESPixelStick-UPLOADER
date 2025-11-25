@@ -13,8 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import importlib
 import subprocess
-import zipfile          # for .xlz compression
-import secrets          # for random short .tmp names
+import zipfile          
+import secrets          
 
 # -------------------- Optional GUI imports --------------------
 try:
@@ -73,7 +73,7 @@ def ensure_requirements():
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-# Only run installer in real Python, not in frozen EXE builds
+
 if not getattr(sys, "frozen", False):
     ensure_requirements()
 
@@ -100,7 +100,7 @@ def prompt_with_default(prompt: str, default: str) -> str:
 
 
 # ======================================================================
-# Parse xLights networks XML  (original behavior)
+# Parse xLights networks XML  
 # ======================================================================
 
 def parse_networks_xml(xml_path: Path) -> list[Controller]:
@@ -167,7 +167,7 @@ def parse_networks_xml(xml_path: Path) -> list[Controller]:
 
 
 # ======================================================================
-# FSEQ parsing helpers (original logic)
+# FSEQ parsing helpers 
 # ======================================================================
 
 class FseqFormatError(Exception):
@@ -368,21 +368,14 @@ def worker_generate_for_file(
             compressed_jobs.append((ctl.name, ctl.ip, str(fseq_path)))
             continue
 
-        # Job now points to .xlz instead of .fseq
         compressed_jobs.append((ctl.name, ctl.ip, str(xlz_path)))
 
-        # NOTE: Keeping the original .fseq on disk by design.
-        # If you want to auto-delete, uncomment:
-        # try:
-        #     fseq_path.unlink()
-        # except Exception:
-        #     pass
 
     return compressed_jobs
 
 
 # ======================================================================
-# FTP upload helpers – ACTIVE mode + manual USER/PASS (original)
+# FTP upload helpers – ACTIVE mode + manual USER/PASS 
 # ======================================================================
 
 def ftp_upload_file(
@@ -562,7 +555,7 @@ def ftp_upload_all(
 
 
 # ======================================================================
-# HTTP verification & reboot helpers (original)
+# HTTP verification & reboot helpers
 # ======================================================================
 
 def _extract_remote_names_from_json(obj):
