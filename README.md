@@ -62,9 +62,12 @@ Prompts will guide you through controller selection and optional FTP/upload sett
 - Automatic dependency installation  
 - GUI by default; CLI available  
 
+<<<<<<< HEAD
 ## Project Layout
 
 ```
 FSEQ_Split+Send.py      # Single-file application
 README.md    # Documentation
 ```
+=======
+>>>>>>> 8bd9dda5b0f3b5dfe4d2cf6e4f9c7c7e8e3a0cac
