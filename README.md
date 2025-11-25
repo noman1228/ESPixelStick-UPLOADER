@@ -1,5 +1,6 @@
 # FSEQ Splitter & ESPixelStick Uploader  
-### Generate per-controller FSEQ files + optional FTP upload, verification, reboot
+## F-That-Seq
+### Generate per-controller FSEQ files, compress + optional FTP upload, verification, reboot
 
 This tool automatically:
 
@@ -32,7 +33,7 @@ Without proper V2 uncompressed files, the splitter has nothing to process.
 1. Install Python 3.10+  
 2. Run:
    ```
-   python FSeq.py
+   python FSEQ_Split+Send.py
    ```
 3. Choose:
    - Input directory of **v2 uncompressed** `.fseq` files  
@@ -45,7 +46,7 @@ Without proper V2 uncompressed files, the splitter has nothing to process.
 ## Quick Start — CLI
 
 ```
-python FSeq.py --cli
+python FSEQ_Split+Send.py --cli
 ```
 
 Prompts will guide you through controller selection and optional FTP/upload settings.
@@ -64,6 +65,6 @@ Prompts will guide you through controller selection and optional FTP/upload sett
 ## Project Layout
 
 ```
-FSeq.py      # Single-file application
+FSEQ_Split+Send.py      # Single-file application
 README.md    # Documentation
 ```
