@@ -61,9 +61,3 @@ Prompts will guide you through controller selection and optional FTP/upload sett
 - Automatic dependency installation  
 - GUI by default; CLI available  
 
-## Project Layout
-
-```
-FSeq.py      # Single-file application
-README.md    # Documentation
-```
