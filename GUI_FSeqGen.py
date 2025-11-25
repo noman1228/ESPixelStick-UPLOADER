@@ -13,7 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import importlib
 import subprocess
-import zipfile  # NEW: for .xlz compression
+import zipfile          # for .xlz compression
+import secrets          # for random short .tmp names
 
 # -------------------- Optional GUI imports --------------------
 try:
@@ -99,7 +100,7 @@ def prompt_with_default(prompt: str, default: str) -> str:
 
 
 # ======================================================================
-# Parse xLights networks XML
+# Parse xLights networks XML  (original behavior)
 # ======================================================================
 
 def parse_networks_xml(xml_path: Path) -> list[Controller]:
@@ -165,9 +166,9 @@ def parse_networks_xml(xml_path: Path) -> list[Controller]:
     return controllers
 
 
-# ---------------------------------------------------------------------------
-# FSEQ parsing helpers (v2, uncompressed)
-# ---------------------------------------------------------------------------
+# ======================================================================
+# FSEQ parsing helpers (original logic)
+# ======================================================================
 
 class FseqFormatError(Exception):
     pass
@@ -181,7 +182,6 @@ def read_fseq_header(f):
     if len(base_header) != 32:
         raise FseqFormatError("File too small for FSEQ v2 header (32 bytes).")
 
-    # "FSEQ" / "PSEQ" magic
     magic = base_header[0:4]
     if magic not in (b"FSEQ", b"PSEQ"):
         raise FseqFormatError(f"Unknown FSEQ magic {magic!r}.")
@@ -201,13 +201,11 @@ def read_fseq_header(f):
     compression_type = comp_byte & 0x0F
     sparse_range_count = base_header[22]
 
-    # For our purposes we only support uncompressed v2 files as input
     if compression_type != 0:
         raise FseqFormatError(
             f"Compression type {compression_type} not supported (only uncompressed)."
         )
 
-    # There may be variable headers etc. between 32 and channel_data_offset
     extra_len = channel_data_offset - 32
     if extra_len < 0:
         extra_len = 0
@@ -217,7 +215,6 @@ def read_fseq_header(f):
             f"Truncated header: expected {extra_len} extra bytes, got {len(extra_header)}."
         )
 
-    # header_size should generally match channel_data_offset, but we don't rely on it.
     return (
         base_header,
         extra_header,
@@ -235,47 +232,24 @@ def build_sparse_header_for_controller(
     controller: Controller,
 ) -> bytes:
     """
-    Build a new FSEQ v2 header for a single controller, **without** sparse ranges.
-
-    We keep the file as:
-      - v2 uncompressed
-      - per-controller channel count
-      - no sparse table (sparse_range_count = 0)
-
-    Since the per-controller file already contains only that controller's
-    channels in a dense block, sparse ranges are unnecessary and cause
-    ESPS to complain.
+    Build a per-controller v2 header with no sparse table (your original).
     """
     header = bytearray(base_header)
 
-    # No sparse ranges
     sparse_count = 0
     sparse_table_len = 0
 
-    # New header size = base 32 + existing extra_header, no sparse table
     header_size = 32 + len(extra_header) + sparse_table_len
 
-    # Channel Data Offset (bytes 4-5) and Header Size (bytes 8-9)
     header[4:6] = header_size.to_bytes(2, "little")
     header[8:10] = header_size.to_bytes(2, "little")
 
-    # Channel count per frame: this controller only
     header[10:14] = controller.max_channels.to_bytes(4, "little")
 
-    # CompressionType/ExtBlockCount at byte 20:
-    # keep upper 4 bits (extended compression block count), force compression type to 0
     header[20] = (header[20] & 0xF0) | 0x00
-
-    # Compression Block Count at byte 21 (lower 8 bits) = 0 (uncompressed)
     header[21] = 0
-
-    # Sparse Range Count at byte 22 = 0 (no sparse data present)
     header[22] = sparse_count
 
-    # Reserved / flags at byte 23: leave as-is or zero if you want
-    # header[23] = 0
-
-    # No sparse table appended
     header_bytes = bytes(header) + extra_header
     if len(header_bytes) != header_size:
         raise RuntimeError(
@@ -293,7 +267,7 @@ def worker_generate_for_file(
     input_path_str: str,
     controllers: list[Controller],
     output_root: str,
-    compress: bool = False,   # NEW: if True, create .xlz and return those for upload
+    compress: bool = False,   # if True, create .xlz and return those for upload
 ) -> list[tuple[str, str, str]]:
     """
     Process one global .fseq file and create per-controller files.
@@ -302,7 +276,7 @@ def worker_generate_for_file(
     for later FTP upload.
 
     If compress=True, local_output_path points to ORIGINALNAME.xlz
-    (ZIP file containing the per-controller .fseq).
+    (ZIP file containing the per-controller .fseq, stored as a random .tmp).
     """
     input_path = Path(input_path_str)
     jobs: list[tuple[str, str, str]] = []
@@ -361,12 +335,13 @@ def worker_generate_for_file(
     for _, dst in controller_files:
         dst.close()
 
-    # If no compression requested, keep original behavior
+    # If no compression requested, keep original behavior (return raw .fseq jobs)
     if not compress:
         return jobs
 
     # ==========================
-    # NEW: ZIP COMPRESS EACH FILE (.xlz)
+    # ZIP COMPRESS EACH FILE (.xlz), NO ZIP64
+    # Internal file name: RANDOM_SHORT_NAME.tmp
     # ==========================
     compressed_jobs: list[tuple[str, str, str]] = []
     for ctl, _ in controller_files:
@@ -374,10 +349,19 @@ def worker_generate_for_file(
         fseq_path = out_dir / input_path.name
         xlz_path = fseq_path.with_suffix(".xlz")
 
+        # Random short temp name used INSIDE the zip
+        # 8 hex chars + ".tmp" -> compliant short-ish name
+        internal_tmp_name = secrets.token_hex(4) + ".tmp"
+
         try:
-            with zipfile.ZipFile(xlz_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                # Archive name is the original .fseq filename
-                zf.write(fseq_path, arcname=fseq_path.name)
+            with zipfile.ZipFile(
+                xlz_path,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                allowZip64=False,  # hard-disable ZIP64 for max compatibility
+            ) as zf:
+                # Archive name is the random .tmp filename
+                zf.write(fseq_path, arcname=internal_tmp_name)
         except Exception as e:
             print(f"[ZIP ERROR] Could not compress {fseq_path.name}: {e}")
             # Fall back to uploading raw .fseq for this controller
@@ -703,7 +687,7 @@ def print_sync_report(controller_reports, verification_results, reboot_results):
 
 
 # ======================================================================
-# Tkinter GUI front-end (NEW)
+# Tkinter GUI front-end
 # ======================================================================
 
 if TK_AVAILABLE:
@@ -734,7 +718,7 @@ if TK_AVAILABLE:
             self.worker_thread = None
             self.running = False
 
-            # NEW: GUI option for compression
+            # GUI option for compression
             self.compress_var = tk.BooleanVar(value=True)
 
             self._build_ui()
@@ -826,7 +810,7 @@ if TK_AVAILABLE:
             )
             self.reboot_cb.grid(row=3, column=2, columnspan=2, sticky="w")
 
-            # NEW: Compression checkbox (independent of FTP enable)
+            # Compression checkbox (independent of FTP enable)
             self.compress_cb = ttk.Checkbutton(
                 ftp_frame,
                 text="Compress each per-controller file to ZIP (.xlz) before upload",
@@ -909,7 +893,7 @@ if TK_AVAILABLE:
                 self.reboot_cb,
             ]:
                 widget.configure(state=state)
-            # Compression checkbox is left enabled even if FTP is disabled
+            # Compression checkbox is left enabled even if FTP is disabled,
             # so user can still generate .xlz files locally.
 
         # -------- controller selection dialog (from networks XML) ----------
@@ -1032,7 +1016,7 @@ if TK_AVAILABLE:
                 "ftp_debug": self.ftp_debug_var.get(),
                 "do_verify": self.verify_var.get(),
                 "do_reboot": self.reboot_var.get(),
-                "compress": self.compress_var.get(),  # NEW
+                "compress": self.compress_var.get(),
             }
 
             self.worker_thread = threading.Thread(
@@ -1197,7 +1181,7 @@ def main() -> None:
 
     controllers = parse_networks_xml(xml_path)
 
-    # NEW: optional controller subset selection
+    # optional controller subset selection
     print("\nControllers discovered:")
     for idx, c in enumerate(controllers, 1):
         print(
@@ -1249,7 +1233,7 @@ def main() -> None:
     output_root_path = Path(output_root).resolve()
     output_root_path.mkdir(parents=True, exist_ok=True)
 
-    # NEW: ask whether to compress to .xlz
+    # ask whether to compress to .xlz
     compress_str = prompt_with_default(
         "Compress per-controller files to ZIP (.xlz)? (y/n)", "y"
     )
